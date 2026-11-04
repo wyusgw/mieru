@@ -132,6 +132,41 @@ func (c *AEADBlockCipher) Encrypt(plaintext []byte) ([]byte, error) {
 	return dst, nil
 }
 
+// EncryptAppend is Encrypt, appending the result to dst instead of
+// allocating it.
+func (c *AEADBlockCipher) EncryptAppend(dst, plaintext []byte) ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var nonce []byte
+	var err error
+	needSendNonce := true
+	if c.enableImplicitNonce {
+		if len(c.implicitNonce) == 0 {
+			c.implicitNonce, err = c.newNonce()
+			if err != nil {
+				return nil, fmt.Errorf("newNonce() failed: %w", err)
+			}
+			c.implicitNonce = c.addUserHintToNonce(c.implicitNonce)
+			nonce = make([]byte, len(c.implicitNonce))
+			copy(nonce, c.implicitNonce)
+		} else {
+			c.increaseNonce()
+			nonce = c.implicitNonce
+			needSendNonce = false
+		}
+	} else {
+		nonce, err = c.newNonce()
+		if err != nil {
+			return nil, fmt.Errorf("newNonce() failed: %w", err)
+		}
+		nonce = c.addUserHintToNonce(nonce)
+	}
+	if needSendNonce {
+		dst = append(dst, nonce...)
+	}
+	return c.aead.Seal(dst, nonce, plaintext, nil), nil
+}
+
 func (c *AEADBlockCipher) EncryptWithNonce(plaintext, nonce []byte) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

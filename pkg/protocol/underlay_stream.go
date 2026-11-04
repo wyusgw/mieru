@@ -23,6 +23,7 @@ import (
 	"math"
 	mrand "math/rand"
 	"net"
+	"sync"
 	"time"
 
 	apicommon "github.com/enfein/mieru/v3/apis/common"
@@ -593,20 +594,34 @@ func (t *StreamUnderlay) writeOneSegment(seg *segment) error {
 		}
 
 		plaintextMetadata := seg.metadata.Marshal()
-		encryptedMetadata, err := t.send.Encrypt(plaintextMetadata)
+		var err error
+		send, ok := t.send.(*cipher.AEADBlockCipher)
+		var dataToSend []byte
+		var pooled *[]byte
+		if ok {
+			pooled = segmentBufPool.Get().(*[]byte)
+			dataToSend, err = send.EncryptAppend((*pooled)[:0], plaintextMetadata)
+			if err == nil && len(seg.payload) > 0 {
+				dataToSend, err = send.EncryptAppend(dataToSend, seg.payload)
+			}
+		} else {
+			dataToSend, err = t.send.Encrypt(plaintextMetadata)
+			if err == nil && len(seg.payload) > 0 {
+				var encryptedPayload []byte
+				encryptedPayload, err = t.send.Encrypt(seg.payload)
+				dataToSend = append(dataToSend, encryptedPayload...)
+			}
+		}
 		if err != nil {
 			return fmt.Errorf("Encrypt() failed: %w", err)
 		}
-		dataToSend := encryptedMetadata
-		if len(seg.payload) > 0 {
-			encryptedPayload, err := t.send.Encrypt(seg.payload)
-			if err != nil {
-				return fmt.Errorf("Encrypt() failed: %w", err)
-			}
-			dataToSend = append(dataToSend, encryptedPayload...)
-		}
 		dataToSend = append(dataToSend, padding...)
-		if err := t.writeWithPossibleFragment(dataToSend); err != nil {
+		err = t.writeWithPossibleFragment(dataToSend)
+		if pooled != nil {
+			*pooled = dataToSend[:0]
+			segmentBufPool.Put(pooled)
+		}
+		if err != nil {
 			return err
 		}
 		t.outBytes.Add(int64(len(dataToSend)))
@@ -640,6 +655,36 @@ func (t *StreamUnderlay) writeOneSegment(seg *segment) error {
 		plaintextMetadata := seg.metadata.Marshal()
 		if err := t.maybeInitSendBlockCipher(); err != nil {
 			return fmt.Errorf("maybeInitSendBlockCipher() failed: %w", err)
+		}
+		if send, ok := t.send.(*cipher.AEADBlockCipher); ok && !lowEntropy {
+			pooled := segmentBufPool.Get().(*[]byte)
+			dataToSend, err := send.EncryptAppend((*pooled)[:0], plaintextMetadata)
+			if err == nil {
+				dataToSend = append(dataToSend, padding1...)
+				if len(seg.payload) > 0 {
+					dataToSend, err = send.EncryptAppend(dataToSend, seg.payload)
+				}
+			}
+			if err != nil {
+				segmentBufPool.Put(pooled)
+				return fmt.Errorf("Encrypt() failed: %w", err)
+			}
+			dataToSend = append(dataToSend, padding2...)
+			_, err = t.conn.Write(dataToSend)
+			*pooled = dataToSend[:0]
+			segmentBufPool.Put(pooled)
+			if err != nil {
+				return fmt.Errorf("Write() failed: %w", err)
+			}
+			t.outBytes.Add(int64(len(dataToSend)))
+			if t.isClient {
+				metrics.UploadBytes.Add(int64(len(dataToSend)))
+			} else {
+				metrics.DownloadBytes.Add(int64(len(dataToSend)))
+			}
+			metrics.OutputPaddingBytes.Add(int64(len(padding1)))
+			metrics.OutputPaddingBytes.Add(int64(len(padding2)))
+			return nil
 		}
 		encryptedMetadata, err := t.send.Encrypt(plaintextMetadata)
 		if err != nil {
@@ -776,6 +821,10 @@ func (t *StreamUnderlay) maybeInitSendBlockCipher() error {
 
 // writeWithPossibleFragment writes data to the stream network connection
 // with or without fragmentation depending on the traffic pattern.
+// segmentBufPool holds the buffers writeOneSegment assembles a segment in.
+// conn.Write is done with the buffer when it returns, so it can be reused.
+var segmentBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 40*1024); return &b }}
+
 func (t *StreamUnderlay) writeWithPossibleFragment(dataToSend []byte) error {
 	if t.trafficPattern == nil || t.trafficPattern.GetTcpFragment() == nil || !t.trafficPattern.GetTcpFragment().GetEnable() {
 		if _, err := t.conn.Write(dataToSend); err != nil {
