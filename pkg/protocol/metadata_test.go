@@ -33,7 +33,7 @@ func TestSessionStruct(t *testing.T) {
 		sessionID:  mrand.Uint32(),
 		statusCode: uint8(mrand.Uint32()),
 		seq:        mrand.Uint32(),
-		payloadLen: uint16(mrand.Uint32()),
+		payloadLen: uint16(mrand.Intn(MaxSessionOpenPayload + 1)),
 		suffixLen:  uint8(mrand.Uint32()),
 	}
 	b := s.Marshal()
@@ -177,7 +177,7 @@ func TestLowEntropyDataAckStruct(t *testing.T) {
 	}
 }
 
-func TestLowEntropyDataAckStructRejectsInvalidMetadata(t *testing.T) {
+func TestLowEntropyDataAckRejectsInvalidMetadata(t *testing.T) {
 	valid := (&dataAckStruct{
 		baseStruct:             baseStruct{protocol: uint8(dataServerToClientLowEntropy)},
 		lowEntropyMode:         uint8(appctlpb.LowEntropyMode_LOW_ENTROPY_MODE_32),

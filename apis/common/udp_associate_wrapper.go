@@ -20,17 +20,36 @@ import (
 	"fmt"
 	"net"
 
+	"github.com/enfein/mieru/v3/apis/constant"
 	"github.com/enfein/mieru/v3/apis/model"
+	"github.com/enfein/mieru/v3/internal/bufpool"
 )
 
 // UDPAssociateWrapper wraps a raw UDP packet with socks5 UDP association header.
 type UDPAssociateWrapper struct {
 	net.PacketConn
+	readFromFQDN bool
+}
+
+// UDPAssociateWrapperOptions configures a UDPAssociateWrapper.
+type UDPAssociateWrapperOptions interface {
+	apply(*UDPAssociateWrapper)
+}
+
+// UDPAssociateReadFromFQDN allows ReadFrom to return a model.NetAddrSpec
+// containing the FQDN when a packet uses an FQDN in its UDP associate header.
+// IP addresses are still returned as *net.UDPAddr.
+type UDPAssociateReadFromFQDN struct{}
+
+func (UDPAssociateReadFromFQDN) apply(w *UDPAssociateWrapper) {
+	w.readFromFQDN = true
 }
 
 // ReadFrom receives a packet and strips the socks5 UDP associate header.
 func (w *UDPAssociateWrapper) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
-	b := make([]byte, len(p)+256) // add some space to parse the header
+	buf := bufpool.Acquire(len(p) + constant.Socks5MaxUDPHeaderLen)
+	defer buf.Release()
+	b := buf.Bytes()
 	n, addr, err = w.PacketConn.ReadFrom(b)
 	if err != nil {
 		return
@@ -56,13 +75,20 @@ func (w *UDPAssociateWrapper) ReadFrom(p []byte) (n int, addr net.Addr, err erro
 	if err = destination.ReadFromSocks5(r); err != nil {
 		return
 	}
-	if destination.FQDN != "" {
+	if destination.FQDN != "" && !w.readFromFQDN {
 		err = fmt.Errorf("peer used FQDN in UDP associate header, which is unsupported")
 		return
 	}
 
-	n, err = r.Read(p)
-	// Caller may expect the returned address to be *net.UDPAddr.
+	// An empty UDP payload is valid and must not return io.EOF.
+	// RFC 8085: A UDP receiver can receive a valid UDP datagram with a zero-length payload.
+	n = copy(p, b[len(b)-r.Len():])
+
+	if destination.FQDN != "" {
+		destination.Net = "udp"
+		addr = destination
+		return
+	}
 	addr = &net.UDPAddr{
 		IP:   destination.IP,
 		Port: destination.Port,
@@ -88,6 +114,10 @@ func (w *UDPAssociateWrapper) WriteTo(p []byte, addr net.Addr) (n int, err error
 }
 
 // NewUDPAssociateWrapper creates a UDPAssociateWrapper.
-func NewUDPAssociateWrapper(conn net.PacketConn) *UDPAssociateWrapper {
-	return &UDPAssociateWrapper{PacketConn: conn}
+func NewUDPAssociateWrapper(conn net.PacketConn, options ...UDPAssociateWrapperOptions) *UDPAssociateWrapper {
+	w := &UDPAssociateWrapper{PacketConn: conn}
+	for _, option := range options {
+		option.apply(w)
+	}
+	return w
 }

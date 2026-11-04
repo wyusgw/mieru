@@ -16,12 +16,13 @@
 package common_test
 
 import (
+	"bytes"
 	"net"
 	"testing"
 
 	"github.com/enfein/mieru/v3/apis/common"
 	"github.com/enfein/mieru/v3/apis/model"
-	"github.com/enfein/mieru/v3/pkg/testtool"
+	"github.com/enfein/mieru/v3/internal/testtool"
 )
 
 func TestUDPAssociateWrapper(t *testing.T) {
@@ -61,5 +62,100 @@ func TestUDPAssociateWrapper(t *testing.T) {
 	}
 	if err = outConn.Close(); err != nil {
 		t.Errorf("Close() failed: %v", err)
+	}
+}
+
+func TestUDPAssociateWrapperEmptyPayload(t *testing.T) {
+	for _, host := range []string{"1.1.1.1", "::1"} {
+		t.Run(host, func(t *testing.T) {
+			in, out := testtool.BufPipe()
+			inConn := common.NewUDPAssociateWrapper(common.NewPacketOverStreamTunnel(in))
+			outConn := common.NewUDPAssociateWrapper(common.NewPacketOverStreamTunnel(out))
+			defer inConn.Close()
+			defer outConn.Close()
+
+			addr := &net.UDPAddr{IP: net.ParseIP(host), Port: 8964}
+
+			// A nonempty packet must still be readable after empty packets.
+			for _, payload := range [][]byte{nil, {}, []byte("ping")} {
+				n, err := inConn.WriteTo(payload, addr)
+				if err != nil {
+					t.Fatalf("WriteTo() failed: %v", err)
+				}
+				if n != len(payload) {
+					t.Fatalf("WriteTo() returned %d, want %d", n, len(payload))
+				}
+
+				buf := make([]byte, 16)
+				n, gotAddr, err := outConn.ReadFrom(buf)
+				if err != nil {
+					t.Fatalf("ReadFrom() failed for payload %v: %v", payload, err)
+				}
+				if n != len(payload) || !bytes.Equal(buf[:n], payload) {
+					t.Fatalf("ReadFrom() payload = %v, want %v", buf[:n], payload)
+				}
+				gotUDPAddr, ok := gotAddr.(*net.UDPAddr)
+				if !ok || !gotUDPAddr.IP.Equal(addr.IP) || gotUDPAddr.Port != addr.Port {
+					t.Fatalf("ReadFrom() address = %v, want %v", gotAddr, addr)
+				}
+			}
+		})
+	}
+}
+
+func TestUDPAssociateWrapperOptions(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		host    string
+		options []common.UDPAssociateWrapperOptions
+		wantErr bool
+	}{
+		{name: "FQDN rejected by default", host: "example.com", wantErr: true},
+		{name: "FQDN enabled", host: "example.com", options: []common.UDPAssociateWrapperOptions{common.UDPAssociateReadFromFQDN{}}},
+		{name: "repeated options", host: "example.com", options: []common.UDPAssociateWrapperOptions{common.UDPAssociateReadFromFQDN{}, common.UDPAssociateReadFromFQDN{}}},
+		{name: "IPv4 default", host: "1.1.1.1"},
+		{name: "IPv4 with option", host: "1.1.1.1", options: []common.UDPAssociateWrapperOptions{common.UDPAssociateReadFromFQDN{}}},
+		{name: "IPv6 default", host: "::1"},
+		{name: "IPv6 with option", host: "::1", options: []common.UDPAssociateWrapperOptions{common.UDPAssociateReadFromFQDN{}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in, out := testtool.BufPipe()
+			inConn := common.NewUDPAssociateWrapper(common.NewPacketOverStreamTunnel(in))
+			outConn := common.NewUDPAssociateWrapper(common.NewPacketOverStreamTunnel(out), tc.options...)
+			defer inConn.Close()
+			defer outConn.Close()
+
+			destination := model.NetAddrSpec{Net: "udp"}
+			if err := destination.AddrSpec.From(net.JoinHostPort(tc.host, "8964")); err != nil {
+				t.Fatal(err)
+			}
+			for _, payload := range [][]byte{nil, []byte("ping")} {
+				if _, err := inConn.WriteTo(payload, destination); err != nil {
+					t.Fatalf("WriteTo() failed: %v", err)
+				}
+				buf := make([]byte, 16)
+				n, addr, err := outConn.ReadFrom(buf)
+				if (err != nil) != tc.wantErr {
+					t.Fatalf("ReadFrom() error = %v, wantErr %v", err, tc.wantErr)
+				}
+				if tc.wantErr {
+					continue
+				}
+				if n != len(payload) || !bytes.Equal(buf[:n], payload) {
+					t.Fatalf("ReadFrom() payload = %v, want %v", buf[:n], payload)
+				}
+				if destination.FQDN != "" {
+					got, ok := addr.(model.NetAddrSpec)
+					if !ok || got.FQDN != destination.FQDN || got.IP != nil || got.Port != destination.Port || got.Net != "udp" {
+						t.Errorf("ReadFrom() address = %#v, want %#v", addr, destination)
+					}
+				} else {
+					got, ok := addr.(*net.UDPAddr)
+					if !ok || !got.IP.Equal(destination.IP) || got.Port != destination.Port {
+						t.Errorf("ReadFrom() address = %#v, want %v", addr, destination)
+					}
+				}
+			}
+		})
 	}
 }

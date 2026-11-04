@@ -17,6 +17,8 @@ package protocol
 
 import (
 	"bytes"
+	"context"
+	"net"
 	"testing"
 	"time"
 
@@ -26,31 +28,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-func TestSessionReceiveWindowSize(t *testing.T) {
-	s := NewSession(1, false, 1400, nil, nil)
-	if got := s.recvQueue.Remaining(); got != segmentTreeCapacity {
-		t.Fatalf("recvQueue capacity = %d, want %d", got, segmentTreeCapacity)
-	}
-	if got := s.receiveWindowSize(); got != segmentTreeCapacity {
-		t.Fatalf("receiveWindowSize() = %d, want %d", got, segmentTreeCapacity)
-	}
-
-	if !s.recvBuf.Insert(testDataSegment(1, 1, []byte("a"), common.PacketTransport)) {
-		t.Fatalf("insert segment to recvBuf failed")
-	}
-	if got := s.receiveWindowSize(); got != segmentTreeCapacity-1 {
-		t.Fatalf("receiveWindowSize() with recvBuf = %d, want %d", got, segmentTreeCapacity-1)
-	}
-
-	if !s.recvQueue.Insert(testDataSegment(1, 2, []byte("b"), common.PacketTransport)) {
-		t.Fatalf("insert segment to recvQueue failed")
-	}
-	if got := s.receiveWindowSize(); got != segmentTreeCapacity-2 {
-		t.Fatalf("receiveWindowSize() with recvBuf and recvQueue = %d, want %d", got, segmentTreeCapacity-2)
-	}
-}
-
-func TestDeliverSegmentToSessionUnblocksWhenSessionClosed(t *testing.T) {
+func TestDeliverSegmentUnblocksOnSessionClose(t *testing.T) {
 	underlay := newBaseUnderlay(false, 1400, nil)
 	session := NewSession(1, false, 1400, nil, nil)
 	seg := testDataSegment(1, 1, []byte("a"), common.StreamTransport)
@@ -84,7 +62,7 @@ func TestDeliverSegmentToSessionUnblocksWhenSessionClosed(t *testing.T) {
 	}
 }
 
-func TestStreamUnderlayIgnoresControlSegmentsForClosedClientSession(t *testing.T) {
+func TestStreamUnderlayIgnoresResponsesForClosedSession(t *testing.T) {
 	underlay := &StreamUnderlay{
 		baseUnderlay: *newBaseUnderlay(true, 1400, nil),
 	}
@@ -104,7 +82,7 @@ func TestStreamUnderlayIgnoresControlSegmentsForClosedClientSession(t *testing.T
 	}
 }
 
-func TestPacketUnderlayIgnoresControlSegmentsForClosedClientSession(t *testing.T) {
+func TestPacketUnderlayIgnoresResponsesForClosedSession(t *testing.T) {
 	underlay := &PacketUnderlay{
 		baseUnderlay: *newBaseUnderlay(true, 1400, nil),
 	}
@@ -124,7 +102,9 @@ func TestPacketUnderlayIgnoresControlSegmentsForClosedClientSession(t *testing.T
 	}
 }
 
-func TestStreamSessionLowEntropyWriteChunk(t *testing.T) {
+// TestStreamLowEntropyWriteChunk verifies framing metadata, fragmentation,
+// and plaintext preservation for all low-entropy modes.
+func TestStreamLowEntropyWriteChunk(t *testing.T) {
 	tests := []struct {
 		mode              appctlpb.LowEntropyMode
 		rotation          appctlpb.LowEntropyMaskRotation
@@ -185,7 +165,9 @@ func TestStreamSessionLowEntropyWriteChunk(t *testing.T) {
 	}
 }
 
-func TestPacketSessionLowEntropyWriteChunk(t *testing.T) {
+// TestPacketLowEntropyWriteChunk verifies framing metadata, MTU-bounded
+// fragmentation, and plaintext preservation for all low-entropy modes.
+func TestPacketLowEntropyWriteChunk(t *testing.T) {
 	tests := []struct {
 		mode     appctlpb.LowEntropyMode
 		rotation appctlpb.LowEntropyMaskRotation
@@ -203,9 +185,9 @@ func TestPacketSessionLowEntropyWriteChunk(t *testing.T) {
 		t.Run(test.mode.String(), func(t *testing.T) {
 			s := NewSession(1, true, 1400, nil, testLowEntropyTrafficPattern(test.mode, test.rotation))
 			s.transportProtocol = common.PacketTransport
-			fragmentSize, err := maxFragmentSizeWithLowEntropy(s.mtu, s.transportProtocol, test.mode)
+			fragmentSize, err := maxFragmentSize(s.mtu, s.transportProtocol, test.mode)
 			if err != nil {
-				t.Fatalf("maxFragmentSizeWithLowEntropy() failed: %v", err)
+				t.Fatalf("maxFragmentSize() failed: %v", err)
 			}
 			wantFragments := (len(payload)-1)/fragmentSize + 1
 			segments, n, err := collectSessionSegments(t, s, wantFragments, func() (int, error) {
@@ -242,9 +224,7 @@ func TestPacketSessionLowEntropyWriteChunk(t *testing.T) {
 	}
 }
 
-// In packet transport, verify data is piggyback to open session request
-// when low entropy is disabled.
-func TestSessionFirstPacketWritePiggyback(t *testing.T) {
+func TestFirstPacketWritePiggyback(t *testing.T) {
 	payload := []byte("first packet write")
 	s := NewSession(1, true, 1400, nil, nil)
 	s.transportProtocol = common.PacketTransport
@@ -261,9 +241,7 @@ func TestSessionFirstPacketWritePiggyback(t *testing.T) {
 	}
 }
 
-// In packet transport, verify data is not piggyback to open session request
-// when low entropy is enabled.
-func TestSessionFirstPacketWriteLowEntropyNoPiggyback(t *testing.T) {
+func TestLowEntropyFirstPacketNoPiggyback(t *testing.T) {
 	payload := []byte("low entropy first packet write")
 	s := NewSession(1, true, 1400, nil, testLowEntropyTrafficPattern(appctlpb.LowEntropyMode_LOW_ENTROPY_MODE_32, appctlpb.LowEntropyMaskRotation_LOW_ENTROPY_MASK_ROTATE_LEFT_3))
 	s.transportProtocol = common.PacketTransport
@@ -283,7 +261,7 @@ func TestSessionFirstPacketWriteLowEntropyNoPiggyback(t *testing.T) {
 	}
 }
 
-func TestSessionPacketLowEntropyDuplicateAndReordering(t *testing.T) {
+func TestPacketLowEntropyDuplicateAndReordering(t *testing.T) {
 	s := NewSession(1, true, 1400, nil, nil)
 	s.transportProtocol = common.PacketTransport
 	newSegment := func(seq uint32, payload string) *segment {
@@ -328,9 +306,9 @@ func TestSessionPacketLowEntropyDuplicateAndReordering(t *testing.T) {
 	}
 }
 
-// Verify that server stays with low entropy as long as client ever used low entropy.
-// This case shouldn't happen in actual deployment though.
-func TestSessionServerLowEntropySignalIsSticky(t *testing.T) {
+// TestServerLowEntropySignalIsSticky verifies that the server keeps using
+// low entropy after a client switches back to regular data segments.
+func TestServerLowEntropySignalIsSticky(t *testing.T) {
 	s := NewSession(1, false, 1400, nil, testLowEntropyTrafficPattern(
 		appctlpb.LowEntropyMode_LOW_ENTROPY_MODE_48,
 		appctlpb.LowEntropyMaskRotation_LOW_ENTROPY_MASK_ROTATE_LEFT_1,
@@ -359,7 +337,33 @@ func TestSessionServerLowEntropySignalIsSticky(t *testing.T) {
 	}
 }
 
-func TestSessionLowEntropyApplicationAccountingAndQuota(t *testing.T) {
+func TestSessionReceiveWindowSize(t *testing.T) {
+	s := NewSession(1, false, 1400, nil, nil)
+	if got := s.recvQueue.Remaining(); got != segmentTreeCapacity {
+		t.Fatalf("recvQueue capacity = %d, want %d", got, segmentTreeCapacity)
+	}
+	if got := s.receiveWindowSize(); got != segmentTreeCapacity {
+		t.Fatalf("receiveWindowSize() = %d, want %d", got, segmentTreeCapacity)
+	}
+
+	if !s.recvBuf.Insert(testDataSegment(1, 1, []byte("a"), common.PacketTransport)) {
+		t.Fatalf("insert segment to recvBuf failed")
+	}
+	if got := s.receiveWindowSize(); got != segmentTreeCapacity-1 {
+		t.Fatalf("receiveWindowSize() with recvBuf = %d, want %d", got, segmentTreeCapacity-1)
+	}
+
+	if !s.recvQueue.Insert(testDataSegment(1, 2, []byte("b"), common.PacketTransport)) {
+		t.Fatalf("insert segment to recvQueue failed")
+	}
+	if got := s.receiveWindowSize(); got != segmentTreeCapacity-2 {
+		t.Fatalf("receiveWindowSize() with recvBuf and recvQueue = %d, want %d", got, segmentTreeCapacity-2)
+	}
+}
+
+// TestLowEntropyApplicationAccountingAndQuota verifies that accounting
+// and quota checks use application byte counts rather than encoded wire sizes.
+func TestLowEntropyApplicationAccountingAndQuota(t *testing.T) {
 	userName := t.Name() + "-" + time.Now().Format("150405.000000000")
 	user := &appctlpb.User{
 		Name: proto.String(userName),
@@ -487,4 +491,267 @@ func testDataSegment(sessionID, seq uint32, payload []byte, transport common.Tra
 		payload:   append([]byte(nil), payload...),
 		transport: transport,
 	}
+}
+
+// newTestPacketSession returns an established client packet session that
+// writes to receiverConn, plus the block cipher to decrypt its output.
+func newTestPacketSession(t *testing.T) (*Session, net.PacketConn, cipher.BlockCipher) {
+	t.Helper()
+	block, err := cipher.BlockCipherFromPassword([]byte(t.Name()), true)
+	if err != nil {
+		t.Fatalf("BlockCipherFromPassword() failed: %v", err)
+	}
+	receiverConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.ListenPacket() receiver failed: %v", err)
+	}
+	t.Cleanup(func() { receiverConn.Close() })
+	senderConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.ListenPacket() sender failed: %v", err)
+	}
+	t.Cleanup(func() { senderConn.Close() })
+	sender := &PacketUnderlay{
+		baseUnderlay: *newBaseUnderlay(true, 1400, nil),
+		conn:         senderConn,
+		serverAddr:   receiverConn.LocalAddr(),
+		block:        block,
+	}
+	s := NewSession(1, true, 1400, nil, nil)
+	s.conn = sender
+	s.transportProtocol = common.PacketTransport
+	s.remoteAddr = receiverConn.LocalAddr()
+	s.forwardStateTo(sessionEstablished)
+	return s, receiverConn, block.Clone()
+}
+
+func decryptDataAckForTest(t *testing.T, block cipher.BlockCipher, wire []byte) *dataAckStruct {
+	t.Helper()
+	decrypted, err := block.Decrypt(wire[:packetNonHeaderPosition])
+	if err != nil {
+		t.Fatalf("Decrypt(metadata) failed: %v", err)
+	}
+	das := &dataAckStruct{}
+	if err := das.Unmarshal(decrypted); err != nil {
+		t.Fatalf("Unmarshal(metadata) failed: %v", err)
+	}
+	return das
+}
+
+func TestPacketOutputDelay(t *testing.T) {
+	tests := []struct {
+		name    string
+		setup   func(s *Session)
+		minWant time.Duration
+		maxWant time.Duration
+	}{
+		{
+			name:    "idle waits for heartbeat",
+			setup:   func(s *Session) {},
+			minWant: sessionHeartbeatInterval - sessionHeartbeatJitterMs*time.Millisecond - 100*time.Millisecond,
+			maxWant: sessionHeartbeatInterval + sessionHeartbeatJitterMs*time.Millisecond,
+		},
+		{
+			name:    "pending ack",
+			setup:   func(s *Session) { s.requestPacketAck() },
+			minWant: 0,
+			maxWant: packetAckDelay,
+		},
+		{
+			name: "pending retransmission",
+			setup: func(s *Session) {
+				s.sendBuf.Insert(testDataSegment(1, 0, []byte("a"), common.PacketTransport))
+				s.nextRetransmissionTime.Store(time.Now().Add(50 * time.Millisecond).UnixMicro())
+			},
+			minWant: 40 * time.Millisecond,
+			maxWant: 50 * time.Millisecond,
+		},
+		{
+			name: "overdue retransmission",
+			setup: func(s *Session) {
+				s.sendBuf.Insert(testDataSegment(1, 0, []byte("a"), common.PacketTransport))
+				s.nextRetransmissionTime.Store(0)
+			},
+			minWant: minOutputInterval,
+			maxWant: minOutputInterval,
+		},
+		{
+			name: "stale retransmission time is ignored when sendBuf is empty",
+			setup: func(s *Session) {
+				s.nextRetransmissionTime.Store(0)
+			},
+			minWant: sessionHeartbeatInterval - sessionHeartbeatJitterMs*time.Millisecond - 100*time.Millisecond,
+			maxWant: sessionHeartbeatInterval + sessionHeartbeatJitterMs*time.Millisecond,
+		},
+		{
+			name: "opening client ignores ack and heartbeat",
+			setup: func(s *Session) {
+				s.state.Store(int32(sessionAttached))
+				s.requestPacketAck()
+				s.lastTXTime.Store(0)
+			},
+			minWant: sessionHeartbeatInterval,
+			maxWant: sessionHeartbeatInterval,
+		},
+		{
+			name: "opening client retransmits open request",
+			setup: func(s *Session) {
+				s.state.Store(int32(sessionAttached))
+				s.sendBuf.Insert(testSessionSegment(openSessionRequest, 1, common.PacketTransport))
+				s.nextRetransmissionTime.Store(time.Now().Add(20 * time.Millisecond).UnixMicro())
+			},
+			minWant: 10 * time.Millisecond,
+			maxWant: 20 * time.Millisecond,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			s := NewSession(1, true, 1400, nil, nil)
+			s.transportProtocol = common.PacketTransport
+			s.forwardStateTo(sessionEstablished)
+			test.setup(s)
+			got := s.nextPacketOutputDelay()
+			if got < test.minWant || got > test.maxWant {
+				t.Fatalf("nextPacketOutputDelay() = %v, want in [%v, %v]", got, test.minWant, test.maxWant)
+			}
+		})
+	}
+}
+
+func TestRequestAckCoalesces(t *testing.T) {
+	s := NewSession(1, true, 1400, nil, nil)
+	s.transportProtocol = common.PacketTransport
+	before := time.Now().UnixMicro()
+	s.requestPacketAck()
+	if !s.ackOnDataRecv.Load() {
+		t.Fatal("ackOnDataRecv = false after requestAck()")
+	}
+	deadline := s.ackDeadline.Load()
+	if deadline < before+packetAckDelay.Microseconds() || deadline > time.Now().UnixMicro()+packetAckDelay.Microseconds() {
+		t.Fatalf("ackDeadline = %d, want about now + %v", deadline, packetAckDelay)
+	}
+	select {
+	case <-s.packetOutputWakeup:
+	default:
+		t.Fatal("requestAck() didn't wake up the output loop")
+	}
+
+	// A second request while the first is pending must not delay the ACK
+	// or wake up the output loop again.
+	time.Sleep(200 * time.Microsecond)
+	s.requestPacketAck()
+	if got := s.ackDeadline.Load(); got != deadline {
+		t.Fatalf("ackDeadline changed from %d to %d by a pending request", deadline, got)
+	}
+	select {
+	case <-s.packetOutputWakeup:
+		t.Fatal("pending requestAck() woke up the output loop again")
+	default:
+	}
+}
+
+func TestPacketRetransmissionDeadline(t *testing.T) {
+	s, receiverConn, _ := newTestPacketSession(t)
+
+	// Sending into an empty sendBuf schedules an early check.
+	seg := testDataSegment(1, 0, []byte("first"), common.PacketTransport)
+	if !s.sendQueue.Insert(seg) {
+		t.Fatal("failed to queue segment")
+	}
+	s.runOutputOncePacket()
+	readPacketForTest(t, receiverConn)
+	if s.sendBuf.Len() != 1 {
+		t.Fatalf("sendBuf length = %d, want 1", s.sendBuf.Len())
+	}
+	if got, want := s.nextRetransmissionTime.Load(), seg.txTime+retransmissionCheckDelay.Microseconds(); got != want {
+		t.Fatalf("nextRetransmissionTime after first send = %d, want %d", got, want)
+	}
+
+	// After a retransmission the next check uses the new deadline,
+	// not the expired one.
+	seg.txTime = time.Now().Add(-time.Second).UnixMicro()
+	seg.txTimeout = time.Nanosecond
+	s.nextRetransmissionTime.Store(0)
+	s.runOutputOncePacket()
+	readPacketForTest(t, receiverConn)
+	if seg.txCount != 2 {
+		t.Fatalf("txCount = %d, want 2", seg.txCount)
+	}
+	if got, want := s.nextRetransmissionTime.Load(), seg.txTime+seg.txTimeout.Microseconds(); got != want {
+		t.Fatalf("nextRetransmissionTime after retransmission = %d, want %d", got, want)
+	}
+	if s.nextRetransmissionTime.Load() <= time.Now().UnixMicro() {
+		t.Fatal("nextRetransmissionTime after retransmission is not in the future")
+	}
+
+	// A far away deadline from a backed off segment doesn't delay the
+	// check of a newly sent segment.
+	far := time.Now().Add(maxBackOffDuration).UnixMicro()
+	s.nextRetransmissionTime.Store(far)
+	second := testDataSegment(1, 1, []byte("second"), common.PacketTransport)
+	if !s.sendQueue.Insert(second) {
+		t.Fatal("failed to queue second segment")
+	}
+	s.runOutputOncePacket()
+	readPacketForTest(t, receiverConn)
+	if s.sendBuf.Len() != 2 {
+		t.Fatalf("sendBuf length = %d, want 2", s.sendBuf.Len())
+	}
+	if got, want := s.nextRetransmissionTime.Load(), second.txTime+second.txTimeout.Microseconds(); got != want {
+		t.Fatalf("nextRetransmissionTime after second send = %d, want %d", got, want)
+	}
+}
+
+// TestPacketOutputLoopEventDriven verifies that the packet output loop
+// stays silent when idle, acknowledges received data promptly, and still
+// sends heartbeats.
+func TestPacketOutputLoopEventDriven(t *testing.T) {
+	s, receiverConn, decryptBlock := newTestPacketSession(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	loopDone := make(chan struct{})
+	go func() {
+		defer close(loopDone)
+		s.runOutputLoop(ctx)
+	}()
+	defer func() {
+		cancel()
+		select {
+		case <-loopDone:
+		case <-time.After(time.Second):
+			t.Error("runOutputLoop() didn't stop")
+		}
+	}()
+
+	// Idle session doesn't transmit.
+	expectNoPacketForTest(t, receiverConn)
+
+	// Received data is acknowledged after a short delay.
+	data := testDataSegment(1, 0, []byte("payload"), common.PacketTransport)
+	data.metadata.(*dataAckStruct).baseStruct.protocol = uint8(dataServerToClient)
+	start := time.Now()
+	if err := s.input(data); err != nil {
+		t.Fatalf("input() failed: %v", err)
+	}
+	ack := decryptDataAckForTest(t, decryptBlock, readPacketForTest(t, receiverConn))
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Errorf("ACK arrived after %v, want within 100ms", elapsed)
+	}
+	if ack.Protocol() != ackClientToServer || ack.unAckSeq != 1 {
+		t.Fatalf("ACK = %v, want %v with unAckSeq 1", ack, ackClientToServer)
+	}
+	if s.ackOnDataRecv.Load() {
+		t.Fatal("ackOnDataRecv is still set after the ACK is sent")
+	}
+
+	// Only one ACK is sent and the session returns to idle.
+	expectNoPacketForTest(t, receiverConn)
+
+	// Heartbeat is sent when the interval expires.
+	s.lastTXTime.Store(time.Now().Add(-2 * sessionHeartbeatInterval).UnixMicro())
+	s.wakePacketOutput()
+	heartbeat := decryptDataAckForTest(t, decryptBlock, readPacketForTest(t, receiverConn))
+	if heartbeat.Protocol() != ackClientToServer {
+		t.Fatalf("heartbeat protocol = %v, want %v", heartbeat.Protocol(), ackClientToServer)
+	}
+	expectNoPacketForTest(t, receiverConn)
 }

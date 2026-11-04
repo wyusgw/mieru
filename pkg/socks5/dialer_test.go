@@ -20,6 +20,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"reflect"
 	"strconv"
 	"testing"
 	"time"
@@ -27,6 +28,25 @@ import (
 	apicommon "github.com/enfein/mieru/v3/apis/common"
 	"github.com/enfein/mieru/v3/apis/model"
 )
+
+func TestNewClientDialerFromURI(t *testing.T) {
+	dialer, err := NewClientDialerFromURI("socks5://u1:p1@127.0.0.1:8080?timeout=2s", true)
+	if err != nil {
+		t.Fatalf("NewClientDialerFromURI() failed: %v", err)
+	}
+	if dialer.ProxyAddress != "127.0.0.1:8080" {
+		t.Errorf("ProxyAddress = %q, want %q", dialer.ProxyAddress, "127.0.0.1:8080")
+	}
+	if dialer.Credential == nil || dialer.Credential.User != "u1" || dialer.Credential.Password != "p1" {
+		t.Errorf("Credential = %v, want user u1 and password p1", dialer.Credential)
+	}
+	if dialer.Timeout != 2*time.Second {
+		t.Errorf("Timeout = %v, want %v", dialer.Timeout, 2*time.Second)
+	}
+	if !dialer.Socks5UDPAssociate {
+		t.Error("Socks5UDPAssociate = false, want true")
+	}
+}
 
 func TestClientDialerConnect(t *testing.T) {
 	target := startTCPEchoServer(t)
@@ -104,6 +124,69 @@ func TestClientDialerUDPAssociate(t *testing.T) {
 	}
 }
 
+func TestClientPacketConnReadFromBufferSize(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		size int
+		want string
+	}{
+		{name: "empty", size: 0, want: ""},
+		{name: "short", size: 2, want: "fi"},
+		{name: "exact", size: 5, want: "first"},
+		{name: "large", size: 16, want: "first"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			proxy, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer proxy.Close()
+			udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer udpConn.Close()
+			remote := &net.UDPAddr{IP: net.IPv4(1, 1, 1, 1), Port: 1234}
+			conn := &clientPacketConn{
+				udpConn:          udpConn,
+				serverListenAddr: proxy.LocalAddr().(*net.UDPAddr),
+				remoteAddr:       remote,
+			}
+			if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			for _, payload := range []string{"first", "next"} {
+				pkt, err := wrapSocks5UDPPacket(remote, []byte(payload))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := proxy.WriteToUDP(pkt, udpConn.LocalAddr().(*net.UDPAddr)); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			out := make([]byte, tc.size)
+			n, addr, err := conn.ReadFrom(out)
+			if err != nil {
+				t.Fatalf("ReadFrom() failed: %v", err)
+			}
+			if string(out[:n]) != tc.want || addr != remote {
+				t.Fatalf("ReadFrom() = (%q, %v), want (%q, %v)", out[:n], addr, tc.want, remote)
+			}
+
+			// The unread tail must be discarded with the first datagram.
+			out = make([]byte, 16)
+			n, _, err = conn.ReadFrom(out)
+			if err != nil {
+				t.Fatalf("second ReadFrom() failed: %v", err)
+			}
+			if string(out[:n]) != "next" {
+				t.Fatalf("second ReadFrom() = %q, want %q", out[:n], "next")
+			}
+		})
+	}
+}
+
 func TestClientDialerUDPAssociateDisabled(t *testing.T) {
 	target := startUDPEchoServer(t)
 	proxyAddr := startDatagramModeServer(t, nil)
@@ -155,6 +238,48 @@ func TestClientDialerUDPAssociateFQDN(t *testing.T) {
 	}
 	if !bytes.Equal(out[:n], []byte("pong")) {
 		t.Fatalf("got %v, want %v", out[:n], []byte("pong"))
+	}
+}
+
+func TestParseProxyURI(t *testing.T) {
+	t.Parallel()
+	testcases := []struct {
+		name string
+		uri  string
+		c    ClientDialer
+	}{
+		{
+			name: "full config",
+			uri:  "socks5://u1:p1@127.0.0.1:8080?timeout=1s",
+			c: ClientDialer{
+				Credential: &Credential{
+					User:     "u1",
+					Password: "p1",
+				},
+				ProxyAddress: "127.0.0.1:8080",
+				Timeout:      1 * time.Second,
+			},
+		},
+		{
+			name: "simple socks5",
+			uri:  "socks5://127.0.0.1:8080",
+			c: ClientDialer{
+				ProxyAddress: "127.0.0.1:8080",
+			},
+		},
+	}
+	for _, tc := range testcases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c, err := parseProxyURI(tc.uri)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(c, &tc.c) {
+				t.Fatalf("expect %v got %v", tc.c, c)
+			}
+		})
 	}
 }
 

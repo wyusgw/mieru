@@ -17,22 +17,23 @@ package protocol
 
 import (
 	"context"
-	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	mrand "math/rand"
 	"net"
-	"sync"
 	"time"
 
 	apicommon "github.com/enfein/mieru/v3/apis/common"
+	"github.com/enfein/mieru/v3/internal/bufpool"
 	"github.com/enfein/mieru/v3/pkg/appctl/appctlpb"
 	"github.com/enfein/mieru/v3/pkg/cipher"
 	"github.com/enfein/mieru/v3/pkg/common"
 	"github.com/enfein/mieru/v3/pkg/log"
 	"github.com/enfein/mieru/v3/pkg/mathext"
 	"github.com/enfein/mieru/v3/pkg/metrics"
+	"github.com/enfein/mieru/v3/pkg/protocol/serveruser"
 	"github.com/enfein/mieru/v3/pkg/replay"
 	"github.com/enfein/mieru/v3/pkg/rng"
 	"github.com/enfein/mieru/v3/pkg/stderror"
@@ -57,8 +58,9 @@ type StreamUnderlay struct {
 	block cipher.BlockCipher
 
 	// ---- server fields ----
-	users               map[string]*appctlpb.User
-	userHintIsMandatory bool
+	serverUsers      *serveruser.Registry
+	serverUserSource serveruser.Source
+	serverUserPolicy serveruser.Policy
 }
 
 var _ Underlay = &StreamUnderlay{}
@@ -226,12 +228,18 @@ func (t *StreamUnderlay) RunEventLoop(ctx context.Context) error {
 		if log.IsLevelEnabled(log.TraceLevel) {
 			log.Tracef("%v received %v", t, seg)
 		}
+		if seg.serverUserAuthentication.Valid() {
+			if err := validateNewServerSessionSegment(seg); err != nil {
+				return stderror.WrapErrorWithType(err, stderror.PROTOCOL_ERROR)
+			}
+		}
 		if isSessionProtocol(seg.metadata.Protocol()) {
 			switch seg.metadata.Protocol() {
 			case openSessionRequest:
 				if err := t.onOpenSessionRequest(seg); err != nil {
 					return fmt.Errorf("onOpenSessionRequest() failed: %w", err)
 				}
+				t.commitServerUserAuthentication(seg)
 			case openSessionResponse:
 				if err := t.onOpenSessionResponse(seg); err != nil {
 					return fmt.Errorf("onOpenSessionResponse() failed: %w", err)
@@ -289,13 +297,34 @@ func (t *StreamUnderlay) onOpenSessionRequest(seg *segment) error {
 		log.Debugf("%v received openSessionRequest, but session ID %d is already used", t, sessionID)
 		return nil
 	}
-	session := NewSession(sessionID, false, t.MTU(), t.users, t.trafficPattern)
-	if err := t.AddSession(session, nil); err == nil {
-		if t.deliverSegmentToSession(session, seg) {
-			t.readySessions <- session
-		}
+	policy := t.serverUserPolicy
+	if seg.serverUserAuthentication.Valid() {
+		policy = seg.serverUserAuthentication.Policy()
+	}
+	session := newSessionWithServerUserPolicy(sessionID, false, t.MTU(), policy, nil, t.trafficPattern)
+	if err := t.AddSession(session, nil); err != nil {
+		return err
+	}
+	if !t.deliverSegmentToSession(session, seg) {
+		return fmt.Errorf("failed to deliver open session request for session %d", sessionID)
+	}
+	select {
+	case t.readySessions <- session:
+	case <-t.done:
+		return io.ErrClosedPipe
 	}
 	return nil
+}
+
+// commitServerUserAuthentication is the single TCP cache-recording point. The
+// caller invokes it only after the first segment has passed authentication,
+// replay, metadata, payload, padding, role, session-ID, and dispatch checks.
+func (t *StreamUnderlay) commitServerUserAuthentication(seg *segment) {
+	if seg == nil || !seg.serverUserAuthentication.Valid() {
+		return
+	}
+	t.serverUserPolicy = seg.serverUserAuthentication.Policy()
+	seg.serverUserAuthentication.Record()
 }
 
 func (t *StreamUnderlay) onOpenSessionResponse(seg *segment) error {
@@ -347,8 +376,8 @@ func (t *StreamUnderlay) readOneSegment() (*segment, error) {
 	}
 	encryptedMeta := make([]byte, readLen)
 	if n, err := io.ReadFull(t.conn, encryptedMeta); err != nil {
-		if stderror.IsTimeout(err) && n == 0 {
-			// No TCP data received. Caller will retry.
+		if stderror.IsTimeout(err) && n == 0 && !errors.Is(err, net.ErrClosed) {
+			// Retry read deadlines, but don't retry when underlay is closed.
 			return nil, nil
 		}
 		err = fmt.Errorf("metadata: read %d bytes from StreamUnderlay failed: %w", readLen, err)
@@ -372,11 +401,12 @@ func (t *StreamUnderlay) readOneSegment() (*segment, error) {
 
 	// Decrypt metadata.
 	var decryptedMeta []byte
+	var authentication serveruser.Authentication
 	if t.recv == nil && t.isClient {
 		t.recv = t.block.Clone()
 	}
 	if t.recv == nil {
-		decryptedMeta, err = t.serverInitRecvBlockCipherAndDecryptMetadata(encryptedMeta)
+		decryptedMeta, authentication, err = t.serverInitRecvBlockCipherAndDecryptMetadata(encryptedMeta)
 		cipher.ServerIterateDecrypt.Add(1)
 		if err != nil {
 			cipher.ServerFailedIterateDecrypt.Add(1)
@@ -416,33 +446,50 @@ func (t *StreamUnderlay) readOneSegment() (*segment, error) {
 
 	// Read payload and construct segment.
 	p := decryptedMeta[0]
+	var seg *segment
 	if isSessionProtocol(protocolType(p)) {
 		ss := &sessionStruct{}
 		if err := ss.Unmarshal(decryptedMeta); err != nil {
 			err = fmt.Errorf("Unmarshal() to sessionStruct failed: %w", err)
 			return nil, stderror.WrapErrorWithType(err, stderror.PROTOCOL_ERROR)
 		}
-		return t.readSessionSegment(ss)
+		seg, err = t.readSessionSegment(ss)
 	} else if isDataAckProtocol(protocolType(p)) {
 		das := &dataAckStruct{}
 		if err := das.Unmarshal(decryptedMeta); err != nil {
 			err = fmt.Errorf("Unmarshal() to dataAckStruct failed: %w", err)
 			return nil, stderror.WrapErrorWithType(err, stderror.PROTOCOL_ERROR)
 		}
-		return t.readDataAckSegment(das)
+		seg, err = t.readDataAckSegment(das)
 	} else {
 		err = fmt.Errorf("unable to handle unknown protocol %d", p)
 		return nil, stderror.WrapErrorWithType(err, stderror.PROTOCOL_ERROR)
 	}
+	if err != nil {
+		return nil, err
+	}
+	if authentication.Valid() {
+		seg.serverUserPolicy = authentication.Policy()
+		seg.serverUserAuthentication = authentication
+	}
+	return seg, nil
 }
 
 func (t *StreamUnderlay) readSessionSegment(ss *sessionStruct) (*segment, error) {
 	var decryptedPayload []byte
 	var err error
 
+	var paddingBuf *bufpool.Buffer
+	if ss.suffixLen > 0 {
+		paddingBuf = bufpool.Acquire(int(ss.suffixLen))
+		defer paddingBuf.Release()
+	}
+
 	if ss.payloadLen > 0 {
-		encryptedPayload := make([]byte, ss.payloadLen+cipher.DefaultOverhead)
+		buf := bufpool.Acquire(int(ss.payloadLen) + cipher.DefaultOverhead)
+		encryptedPayload := buf.Bytes()
 		if _, err := io.ReadFull(t.conn, encryptedPayload); err != nil {
+			buf.Release()
 			err = fmt.Errorf("payload: read %d bytes from StreamUnderlay failed: %w", ss.payloadLen+cipher.DefaultOverhead, err)
 			return nil, stderror.WrapErrorWithType(err, stderror.NETWORK_ERROR)
 		}
@@ -456,6 +503,8 @@ func (t *StreamUnderlay) readSessionSegment(ss *sessionStruct) (*segment, error)
 			replay.KnownSession.Add(1)
 		}
 		decryptedPayload, err = t.recv.Decrypt(encryptedPayload)
+		// Decrypt returns independently owned plaintext.
+		buf.Release()
 		if t.isClient {
 			cipher.ClientDirectDecrypt.Add(1)
 		} else {
@@ -472,7 +521,7 @@ func (t *StreamUnderlay) readSessionSegment(ss *sessionStruct) (*segment, error)
 		}
 	}
 	if ss.suffixLen > 0 {
-		padding := make([]byte, ss.suffixLen)
+		padding := paddingBuf.Bytes()
 		if _, err := io.ReadFull(t.conn, padding); err != nil {
 			err = fmt.Errorf("padding: read %d bytes from StreamUnderlay failed: %w", ss.suffixLen, err)
 			return nil, stderror.WrapErrorWithType(err, stderror.NETWORK_ERROR)
@@ -497,8 +546,14 @@ func (t *StreamUnderlay) readDataAckSegment(das *dataAckStruct) (*segment, error
 	var decryptedPayload []byte
 	var err error
 
+	var paddingBuf *bufpool.Buffer
+	if das.prefixLen > 0 || das.suffixLen > 0 {
+		paddingBuf = bufpool.Acquire(int(mathext.Max(das.prefixLen, das.suffixLen)))
+		defer paddingBuf.Release()
+	}
+
 	if das.prefixLen > 0 {
-		padding1 := make([]byte, das.prefixLen)
+		padding1 := paddingBuf.Bytes()[:das.prefixLen]
 		if _, err := io.ReadFull(t.conn, padding1); err != nil {
 			err = fmt.Errorf("padding: read %d bytes from StreamUnderlay failed: %w", das.prefixLen, err)
 			return nil, stderror.WrapErrorWithType(err, stderror.NETWORK_ERROR)
@@ -512,8 +567,10 @@ func (t *StreamUnderlay) readDataAckSegment(das *dataAckStruct) (*segment, error
 	}
 	if das.payloadLen > 0 {
 		wirePayloadLen := int(das.payloadLen) + cipher.DefaultOverhead
-		encryptedPayload := make([]byte, wirePayloadLen)
+		buf := bufpool.Acquire(wirePayloadLen)
+		encryptedPayload := buf.Bytes()
 		if _, err := io.ReadFull(t.conn, encryptedPayload); err != nil {
+			buf.Release()
 			err = fmt.Errorf("payload: read %d bytes from StreamUnderlay failed: %w", wirePayloadLen, err)
 			return nil, stderror.WrapErrorWithType(err, stderror.NETWORK_ERROR)
 		}
@@ -526,6 +583,7 @@ func (t *StreamUnderlay) readDataAckSegment(das *dataAckStruct) (*segment, error
 		if isLowEntropyProtocol(das.Protocol()) {
 			encryptedPayload, err = decodeLowEntropyEncryptedPayload(encryptedPayload, das)
 			if err != nil {
+				buf.Release()
 				err = fmt.Errorf("decode low entropy payload failed: %w", err)
 				return nil, stderror.WrapErrorWithType(err, stderror.PROTOCOL_ERROR)
 			}
@@ -534,6 +592,8 @@ func (t *StreamUnderlay) readDataAckSegment(das *dataAckStruct) (*segment, error
 			replay.KnownSession.Add(1)
 		}
 		decryptedPayload, err = t.recv.Decrypt(encryptedPayload)
+		// Decrypt returns independently owned plaintext.
+		buf.Release()
 		if t.isClient {
 			cipher.ClientDirectDecrypt.Add(1)
 		} else {
@@ -550,7 +610,7 @@ func (t *StreamUnderlay) readDataAckSegment(das *dataAckStruct) (*segment, error
 		}
 	}
 	if das.suffixLen > 0 {
-		padding2 := make([]byte, das.suffixLen)
+		padding2 := paddingBuf.Bytes()[:das.suffixLen]
 		if _, err := io.ReadFull(t.conn, padding2); err != nil {
 			err = fmt.Errorf("padding: read %d bytes from StreamUnderlay failed: %w", das.suffixLen, err)
 			return nil, stderror.WrapErrorWithType(err, stderror.NETWORK_ERROR)
@@ -579,6 +639,7 @@ func (t *StreamUnderlay) writeOneSegment(seg *segment) error {
 	t.sendMutex.Lock()
 	defer t.sendMutex.Unlock()
 
+	firstWrite := t.send == nil
 	if err := t.maybeInitSendBlockCipher(); err != nil {
 		return fmt.Errorf("maybeInitSendBlockCipher() failed: %w", err)
 	}
@@ -594,34 +655,29 @@ func (t *StreamUnderlay) writeOneSegment(seg *segment) error {
 		}
 
 		plaintextMetadata := seg.metadata.Marshal()
-		var err error
-		send, ok := t.send.(*cipher.AEADBlockCipher)
-		var dataToSend []byte
-		var pooled *[]byte
-		if ok {
-			pooled = segmentBufPool.Get().(*[]byte)
-			dataToSend, err = send.EncryptAppend((*pooled)[:0], plaintextMetadata)
-			if err == nil && len(seg.payload) > 0 {
-				dataToSend, err = send.EncryptAppend(dataToSend, seg.payload)
-			}
-		} else {
-			dataToSend, err = t.send.Encrypt(plaintextMetadata)
-			if err == nil && len(seg.payload) > 0 {
-				var encryptedPayload []byte
-				encryptedPayload, err = t.send.Encrypt(seg.payload)
-				dataToSend = append(dataToSend, encryptedPayload...)
-			}
+		encryptedMetadataLen := len(plaintextMetadata) + t.send.Overhead()
+		if firstWrite {
+			encryptedMetadataLen += t.send.NonceSize()
 		}
-		if err != nil {
+		encryptedPayloadLen := 0
+		if len(seg.payload) > 0 {
+			encryptedPayloadLen = len(seg.payload) + t.send.Overhead()
+		}
+		buf := bufpool.Acquire(encryptedMetadataLen + encryptedPayloadLen + len(padding))
+		defer buf.Release()
+		dataToSend := buf.Bytes()
+		if err := t.send.Encrypt(dataToSend[:0], plaintextMetadata); err != nil {
 			return fmt.Errorf("Encrypt() failed: %w", err)
 		}
-		dataToSend = append(dataToSend, padding...)
-		err = t.writeWithPossibleFragment(dataToSend)
-		if pooled != nil {
-			*pooled = dataToSend[:0]
-			segmentBufPool.Put(pooled)
+		offset := encryptedMetadataLen
+		if len(seg.payload) > 0 {
+			if err := t.send.Encrypt(dataToSend[offset:offset], seg.payload); err != nil {
+				return fmt.Errorf("Encrypt() failed: %w", err)
+			}
+			offset += encryptedPayloadLen
 		}
-		if err != nil {
+		copy(dataToSend[offset:], padding)
+		if err := t.writeWithPossibleFragment(dataToSend); err != nil {
 			return err
 		}
 		t.outBytes.Add(int64(len(dataToSend)))
@@ -653,58 +709,40 @@ func (t *StreamUnderlay) writeOneSegment(seg *segment) error {
 		}
 
 		plaintextMetadata := seg.metadata.Marshal()
-		if err := t.maybeInitSendBlockCipher(); err != nil {
-			return fmt.Errorf("maybeInitSendBlockCipher() failed: %w", err)
+		encryptedMetadataLen := len(plaintextMetadata) + t.send.Overhead()
+		if firstWrite {
+			encryptedMetadataLen += t.send.NonceSize()
 		}
-		if send, ok := t.send.(*cipher.AEADBlockCipher); ok && !lowEntropy {
-			pooled := segmentBufPool.Get().(*[]byte)
-			dataToSend, err := send.EncryptAppend((*pooled)[:0], plaintextMetadata)
-			if err == nil {
-				dataToSend = append(dataToSend, padding1...)
-				if len(seg.payload) > 0 {
-					dataToSend, err = send.EncryptAppend(dataToSend, seg.payload)
-				}
+		wirePayloadLen := 0
+		if len(seg.payload) > 0 {
+			wirePayloadLen = len(seg.payload) + t.send.Overhead()
+			if lowEntropy {
+				wirePayloadLen = int(das.payloadLen) + t.send.Overhead()
 			}
-			if err != nil {
-				segmentBufPool.Put(pooled)
-				return fmt.Errorf("Encrypt() failed: %w", err)
-			}
-			dataToSend = append(dataToSend, padding2...)
-			_, err = t.conn.Write(dataToSend)
-			*pooled = dataToSend[:0]
-			segmentBufPool.Put(pooled)
-			if err != nil {
-				return fmt.Errorf("Write() failed: %w", err)
-			}
-			t.outBytes.Add(int64(len(dataToSend)))
-			if t.isClient {
-				metrics.UploadBytes.Add(int64(len(dataToSend)))
-			} else {
-				metrics.DownloadBytes.Add(int64(len(dataToSend)))
-			}
-			metrics.OutputPaddingBytes.Add(int64(len(padding1)))
-			metrics.OutputPaddingBytes.Add(int64(len(padding2)))
-			return nil
 		}
-		encryptedMetadata, err := t.send.Encrypt(plaintextMetadata)
-		if err != nil {
+		buf := bufpool.Acquire(encryptedMetadataLen + len(padding1) + wirePayloadLen + len(padding2))
+		defer buf.Release()
+		dataToSend := buf.Bytes()
+		if err := t.send.Encrypt(dataToSend[:0], plaintextMetadata); err != nil {
 			return fmt.Errorf("Encrypt() failed: %w", err)
 		}
-		dataToSend := append(encryptedMetadata, padding1...)
+		offset := encryptedMetadataLen
+		offset += copy(dataToSend[offset:], padding1)
 		if len(seg.payload) > 0 {
-			encryptedPayload, err := t.send.Encrypt(seg.payload)
-			if err != nil {
+			if err := t.send.Encrypt(dataToSend[offset:offset], seg.payload); err != nil {
 				return fmt.Errorf("Encrypt() failed: %w", err)
 			}
 			if lowEntropy {
-				encryptedPayload, err = encodeLowEntropyEncryptedPayload(encryptedPayload, das)
+				encryptedPayloadLen := len(seg.payload) + t.send.Overhead()
+				encryptedPayload, err := encodeLowEntropyEncryptedPayload(dataToSend[offset:offset+encryptedPayloadLen], das)
 				if err != nil {
 					return fmt.Errorf("encode low entropy payload failed: %w", err)
 				}
+				copy(dataToSend[offset:], encryptedPayload)
 			}
-			dataToSend = append(dataToSend, encryptedPayload...)
+			offset += wirePayloadLen
 		}
-		dataToSend = append(dataToSend, padding2...)
+		copy(dataToSend[offset:], padding2)
 		if _, err := t.conn.Write(dataToSend); err != nil {
 			return fmt.Errorf("Write() failed: %w", err)
 		}
@@ -725,70 +763,24 @@ func (t *StreamUnderlay) writeOneSegment(seg *segment) error {
 	return nil
 }
 
-// serverInitRecvBlockCipherAndDecryptMetadata performs decryption against all
-// registered users and, on success, initializes t.recv with a stateful clone
-// of the single matched cipher. It returns the decrypted metadata.
-func (t *StreamUnderlay) serverInitRecvBlockCipherAndDecryptMetadata(encryptedMeta []byte) ([]byte, error) {
+// serverInitRecvBlockCipherAndDecryptMetadata performs stateless discovery
+// against one current generation and then initializes t.recv from the mutable
+// winning clone. The returned authentication is temporary and must be recorded
+// only after the complete first segment is validated and dispatched.
+func (t *StreamUnderlay) serverInitRecvBlockCipherAndDecryptMetadata(encryptedMeta []byte) ([]byte, serveruser.Authentication, error) {
 	if t.recv != nil {
-		return nil, fmt.Errorf("recv cipher is already set")
+		return nil, serveruser.Authentication{}, fmt.Errorf("recv cipher is already set")
 	}
-	nonce := encryptedMeta[:cipher.DefaultNonceSize]
-
-	var matchedBlock cipher.BlockCipher
-	var matchedUserName string
-
-	// First, try to narrow down the user using the nonce hint.
-	var hintUsers []*appctlpb.User
-	for _, user := range t.users {
-		if cipher.CheckUserFromHint([]byte(user.GetName()), nonce) {
-			hintUsers = append(hintUsers, user)
-		}
+	if t.serverUsers == nil {
+		return nil, serveruser.Authentication{}, fmt.Errorf("server user registry is nil")
 	}
-	for _, hintUser := range hintUsers {
-		cipher.ServerHintMatchDecrypt.Add(1)
-		password, err := hex.DecodeString(hintUser.GetHashedPassword())
-		if err != nil {
-			log.Debugf("Unable to decode hashed password %q from user %q", hintUser.GetHashedPassword(), hintUser.GetName())
-			continue
-		}
-		if len(password) == 0 {
-			password = cipher.HashPassword([]byte(hintUser.GetPassword()), []byte(hintUser.GetName()))
-		}
-		matchedBlock, _, err = cipher.TryDecrypt(encryptedMeta, password, true)
-		if err == nil {
-			matchedUserName = hintUser.GetName()
-			break
-		} else {
-			cipher.ServerFailedHintMatchDecrypt.Add(1)
-		}
+	block, _, authentication, err := t.serverUsers.Discover(encryptedMeta, t.serverUserSource, true)
+	if err != nil {
+		return nil, serveruser.Authentication{}, err
 	}
 
-	if matchedBlock == nil && !t.userHintIsMandatory {
-		// Fallback: try all registered users.
-		for _, user := range t.users {
-			password, err := hex.DecodeString(user.GetHashedPassword())
-			if err != nil {
-				continue
-			}
-			if len(password) == 0 {
-				password = cipher.HashPassword([]byte(user.GetPassword()), []byte(user.GetName()))
-			}
-			matchedBlock, _, err = cipher.TryDecrypt(encryptedMeta, password, true)
-			if err == nil {
-				matchedUserName = user.GetName()
-				break
-			}
-		}
-	}
-	if matchedBlock == nil {
-		return nil, fmt.Errorf("cipher.TryDecrypt() failed for all users")
-	}
-
-	// Clone only the matched cipher as stateful, and re-decrypt to capture nonce state.
-	t.recv = matchedBlock.Clone()
-	t.recv.SetBlockContext(cipher.BlockContext{
-		UserName: matchedUserName,
-	})
+	// Re-decrypt with implicit nonce mode enabled to capture TCP nonce state.
+	t.recv = block
 	if t.trafficPattern != nil {
 		t.recv.SetNoncePattern(t.trafficPattern.GetNonce())
 	}
@@ -796,9 +788,9 @@ func (t *StreamUnderlay) serverInitRecvBlockCipherAndDecryptMetadata(encryptedMe
 	decryptedMeta, err := t.recv.Decrypt(encryptedMeta)
 	if err != nil {
 		t.recv = nil
-		return nil, fmt.Errorf("stateful Decrypt() failed: %w", err)
+		return nil, serveruser.Authentication{}, fmt.Errorf("stateful Decrypt() failed: %w", err)
 	}
-	return decryptedMeta, nil
+	return decryptedMeta, authentication, nil
 }
 
 func (t *StreamUnderlay) maybeInitSendBlockCipher() error {
@@ -821,10 +813,6 @@ func (t *StreamUnderlay) maybeInitSendBlockCipher() error {
 
 // writeWithPossibleFragment writes data to the stream network connection
 // with or without fragmentation depending on the traffic pattern.
-// segmentBufPool holds the buffers writeOneSegment assembles a segment in.
-// conn.Write is done with the buffer when it returns, so it can be reused.
-var segmentBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 40*1024); return &b }}
-
 func (t *StreamUnderlay) writeWithPossibleFragment(dataToSend []byte) error {
 	if t.trafficPattern == nil || t.trafficPattern.GetTcpFragment() == nil || !t.trafficPattern.GetTcpFragment().GetEnable() {
 		if _, err := t.conn.Write(dataToSend); err != nil {
@@ -894,4 +882,29 @@ func (t *StreamUnderlay) cleanSessions() {
 		}
 		return true
 	})
+}
+
+// closeIfIdle closes the transport to interrupt blocked reads, writes, or
+// session delivery, if the transport is idle.
+func (t *StreamUnderlay) closeIfIdle(timeout time.Duration) bool {
+	t.closeMutex.Lock()
+	defer t.closeMutex.Unlock()
+	select {
+	case <-t.done:
+		return false
+	default:
+	}
+	conn, ok := t.conn.(*common.IdleTrackingConn)
+	if !ok || !conn.CloseIfIdle(timeout) {
+		return false
+	}
+	log.Debugf("Closing %v after TCP idle timeout %v", t, timeout)
+	t.sessionCleanTicker.Stop()
+	// The transport is already closed, so skip graceful session close requests.
+	t.sessionMap.Range(func(k, v any) bool {
+		v.(*Session).closeWithError(stderror.ErrTimeout)
+		return true
+	})
+	t.baseUnderlay.Close()
+	return true
 }

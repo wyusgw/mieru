@@ -37,9 +37,8 @@ The mieru proxy software suite consists of two parts, a client software called m
   - [ClashMetaForAndroid](https://github.com/MetaCubeX/ClashMetaForAndroid)
   - [ClashMi](https://clashmi.app/)
   - [Exclave](https://github.com/dyhkwong/Exclave)
-  - [husi](https://codeberg.org/xchacha20-poly1305/husi) + [mieru plugin](https://codeberg.org/xchacha20-poly1305/husi/releases?q=mieru)
+  - [husi](https://github.com/xchacha20-poly1305/husi) + [mieru plugin](https://github.com/xchacha20-poly1305/husi/releases?q=mieru)
   - [Karing](https://karing.app/)
-  - [NekoBoxForAndroid](https://github.com/MatsuriDayo/NekoBoxForAndroid) + [mieru plugin](https://github.com/enfein/NekoBoxPlugins)
 - iOS
   - [ClashMi](https://clashmi.app/)
   - [Karing](https://karing.app/)
@@ -73,5 +72,3 @@ Use GitHub issue.
 ## License
 
 Use of this software is subject to the GPL-3 license.
-
-[![Star History Chart](https://api.star-history.com/svg?repos=enfein/mieru&type=Date)](https://www.star-history.com/#enfein/mieru&Date)

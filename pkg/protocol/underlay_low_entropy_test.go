@@ -18,7 +18,6 @@ package protocol
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/hex"
 	"fmt"
 	"math/bits"
 	"net"
@@ -30,10 +29,9 @@ import (
 	"github.com/enfein/mieru/v3/pkg/common"
 	"github.com/enfein/mieru/v3/pkg/metrics"
 	"github.com/enfein/mieru/v3/pkg/stderror"
-	"google.golang.org/protobuf/proto"
 )
 
-func TestStreamUnderlayPassiveLowEntropyReceive(t *testing.T) {
+func TestStreamLowEntropyReceive(t *testing.T) {
 	payload := []byte("passive low entropy stream payload")
 	wire, recvBlock, wantMetadata, _, _ := buildStreamLowEntropyWire(t, payload, 3, 5)
 	reader, writer := net.Pipe()
@@ -69,7 +67,7 @@ func TestStreamUnderlayPassiveLowEntropyReceive(t *testing.T) {
 	}
 }
 
-func TestStreamUnderlayPassiveLowEntropyReceiveMaxPayload(t *testing.T) {
+func TestStreamLowEntropyReceiveMaxPayload(t *testing.T) {
 	payload := make([]byte, 32764)
 	for i := range payload {
 		payload[i] = byte(i)
@@ -105,7 +103,9 @@ func TestStreamUnderlayPassiveLowEntropyReceiveMaxPayload(t *testing.T) {
 	}
 }
 
-func TestStreamUnderlayLowEntropySendReceive(t *testing.T) {
+// TestStreamLowEntropySendReceive verifies payload preservation, mask generation,
+// padding metrics, and wire byte accounting across all low-entropy modes.
+func TestStreamLowEntropySendReceive(t *testing.T) {
 	tests := []struct {
 		name       string
 		protocol   protocolType
@@ -141,7 +141,7 @@ func TestStreamUnderlayLowEntropySendReceive(t *testing.T) {
 			}
 			seg := &segment{metadata: das, payload: append([]byte(nil), payload...)}
 
-			password := []byte(fmt.Sprintf("%s-password", t.Name()))
+			password := cipher.HashPassword([]byte(fmt.Sprintf("%s-password", t.Name())), []byte("user"))
 			block, err := cipher.BlockCipherFromPassword(password, false)
 			if err != nil {
 				t.Fatalf("BlockCipherFromPassword() failed: %v", err)
@@ -164,10 +164,10 @@ func TestStreamUnderlayLowEntropySendReceive(t *testing.T) {
 			}
 			if test.senderSide {
 				sender.block = block.Clone()
-				receiver.users = map[string]*appctlpb.User{"user": {
-					Name:           proto.String("user"),
-					HashedPassword: proto.String(hex.EncodeToString(password)),
-				}}
+				receiver.serverUsers = testServerUserRegistry(
+					userMap(makeTestUser("user", password)),
+					false,
+				)
 			} else {
 				sender.recv = block.Clone()
 				receiver.block = block.Clone()
@@ -213,7 +213,7 @@ func TestStreamUnderlayLowEntropySendReceive(t *testing.T) {
 	}
 }
 
-func TestPacketUnderlayPassiveLowEntropyReceive(t *testing.T) {
+func TestPacketLowEntropyReceive(t *testing.T) {
 	payload := []byte("passive low entropy packet payload")
 	wire, block, _, _, _ := buildPacketLowEntropyWire(t, payload, 2, 4)
 	receiverConn, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -251,7 +251,9 @@ func TestPacketUnderlayPassiveLowEntropyReceive(t *testing.T) {
 	}
 }
 
-func TestPacketUnderlayLowEntropySendReceive(t *testing.T) {
+// TestPacketLowEntropySendReceive verifies payload preservation, MTU bounds,
+// padding metrics, and wire byte accounting across all low-entropy modes.
+func TestPacketLowEntropySendReceive(t *testing.T) {
 	const mtu = 517
 	tests := []struct {
 		name     string
@@ -271,9 +273,9 @@ func TestPacketUnderlayLowEntropySendReceive(t *testing.T) {
 				caseName = "partial final chunk"
 			}
 			t.Run(test.name+"/"+caseName, func(t *testing.T) {
-				fragmentSize, err := maxFragmentSizeWithLowEntropy(mtu, common.PacketTransport, test.mode)
+				fragmentSize, err := maxFragmentSize(mtu, common.PacketTransport, test.mode)
 				if err != nil {
-					t.Fatalf("maxFragmentSizeWithLowEntropy() failed: %v", err)
+					t.Fatalf("maxFragmentSize() failed: %v", err)
 				}
 				payload := make([]byte, fragmentSize+adjustment)
 				for i := range payload {
@@ -365,6 +367,8 @@ func TestPacketUnderlayLowEntropySendReceive(t *testing.T) {
 	}
 }
 
+// TestLowEntropyUnderlaysRejectCorruption verifies that stream corruption
+// returns the expected error and packet corruption does not block later data.
 func TestLowEntropyUnderlaysRejectCorruption(t *testing.T) {
 	type corruptionCase struct {
 		name           string
@@ -491,7 +495,7 @@ func TestLowEntropyUnderlaysRejectCorruption(t *testing.T) {
 	}
 }
 
-func TestPacketUnderlayDefersLowEntropyDataUntilSessionEstablished(t *testing.T) {
+func TestPacketLowEntropyWaitsForSessionEstablishment(t *testing.T) {
 	const mtu = 517
 	mode := appctlpb.LowEntropyMode_LOW_ENTROPY_MODE_32
 	rotation := appctlpb.LowEntropyMaskRotation_LOW_ENTROPY_MASK_ROTATE_LEFT_3
@@ -635,7 +639,9 @@ func TestPacketUnderlayDefersLowEntropyDataUntilSessionEstablished(t *testing.T)
 	}
 }
 
-func TestPacketUnderlayLowEntropyRetransmissionFreshness(t *testing.T) {
+// TestPacketLowEntropyRetransmissionReencoding verifies that retransmissions
+// retain logical data while refreshing the mask, nonce, and ciphertext.
+func TestPacketLowEntropyRetransmissionReencoding(t *testing.T) {
 	const mtu = 517
 	mode := appctlpb.LowEntropyMode_LOW_ENTROPY_MODE_32
 	payload := []byte("plaintext retained across packet retransmissions")
@@ -791,12 +797,13 @@ func buildStreamLowEntropyWireWithMetadataMutation(t *testing.T, payload []byte,
 	if mutateMetadata != nil {
 		mutateMetadata(&wireMetadata)
 	}
-	encryptedMetadata, err := sendBlock.Encrypt(wireMetadata.Marshal())
-	if err != nil {
+	plaintextMetadata := wireMetadata.Marshal()
+	encryptedMetadata := make([]byte, sendBlock.NonceSize()+len(plaintextMetadata)+sendBlock.Overhead())
+	if err := sendBlock.Encrypt(encryptedMetadata[:0], plaintextMetadata); err != nil {
 		t.Fatalf("Encrypt(metadata) failed: %v", err)
 	}
-	encryptedPayload, err := sendBlock.Encrypt(payload)
-	if err != nil {
+	encryptedPayload := make([]byte, len(payload)+sendBlock.Overhead())
+	if err := sendBlock.Encrypt(encryptedPayload[:0], payload); err != nil {
 		t.Fatalf("Encrypt(payload) failed: %v", err)
 	}
 	if len(encryptedPayload) != len(payload)+cipher.DefaultOverhead {
@@ -831,13 +838,14 @@ func buildPacketLowEntropyWireWithMetadataMutation(t *testing.T, payload []byte,
 	if mutateMetadata != nil {
 		mutateMetadata(&wireMetadata)
 	}
-	encryptedMetadata, err := block.Encrypt(wireMetadata.Marshal())
-	if err != nil {
+	plaintextMetadata := wireMetadata.Marshal()
+	encryptedMetadata := make([]byte, block.NonceSize()+len(plaintextMetadata)+block.Overhead())
+	if err := block.Encrypt(encryptedMetadata[:0], plaintextMetadata); err != nil {
 		t.Fatalf("Encrypt(metadata) failed: %v", err)
 	}
 	nonce := encryptedMetadata[:cipher.DefaultNonceSize]
-	encryptedPayload, err := block.EncryptWithNonce(payload, nonce)
-	if err != nil {
+	encryptedPayload := make([]byte, len(payload)+block.Overhead())
+	if err := block.EncryptWithNonce(encryptedPayload[:0], nonce, payload); err != nil {
 		t.Fatalf("EncryptWithNonce(payload) failed: %v", err)
 	}
 	encoded, err := encodeLowEntropyPayloadWithPaddingBit(encryptedPayload[:len(payload)], appctlpb.LowEntropyMode(das.lowEntropyMode), das.lowEntropyMask, appctlpb.LowEntropyMaskRotation(das.lowEntropyMaskRotation), 0)

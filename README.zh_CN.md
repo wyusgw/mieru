@@ -35,9 +35,8 @@ mieru 代理软件由称为 mieru【見える】的客户端软件和称为 mita
   - [ClashMetaForAndroid](https://github.com/MetaCubeX/ClashMetaForAndroid)
   - [ClashMi](https://clashmi.app/)
   - [Exclave](https://github.com/dyhkwong/Exclave)
-  - [husi](https://codeberg.org/xchacha20-poly1305/husi) + [mieru plugin](https://codeberg.org/xchacha20-poly1305/husi/releases?q=mieru)
+  - [husi](https://github.com/xchacha20-poly1305/husi) + [mieru plugin](https://github.com/xchacha20-poly1305/husi/releases?q=mieru)
   - [Karing](https://karing.app/)
-  - [NekoBoxForAndroid](https://github.com/MatsuriDayo/NekoBoxForAndroid) + [mieru plugin](https://github.com/enfein/NekoBoxPlugins)
 - iOS
   - [ClashMi](https://clashmi.app/)
   - [Karing](https://karing.app/)
@@ -71,5 +70,3 @@ mieru 的翻墙原理与 shadowsocks / v2ray 等软件类似，在客户端和�
 ## 许可证
 
 使用本软件需遵从 GPL-3 协议。
-
-[![Star History Chart](https://api.star-history.com/svg?repos=enfein/mieru&type=Date)](https://www.star-history.com/#enfein/mieru&Date)
