@@ -1,3 +1,6 @@
+# The binary is a stripped Go build: there is no debug info to package.
+%global debug_package %{nil}
+
 Name: mita
 Version: 3.39.0
 Release: 1%{?dist}
