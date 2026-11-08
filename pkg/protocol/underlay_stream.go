@@ -42,6 +42,13 @@ const (
 	streamOverhead = MetadataLength + cipher.DefaultOverhead*2
 )
 
+// payloadPacer is implemented by a server connection that limits how fast
+// clients upload. The read loop calls PacePayload with the payload of each
+// segment it decodes, so that headers and padding are not counted.
+type payloadPacer interface {
+	PacePayload(n int)
+}
+
 var streamReplayCache = replay.NewCache(4*1024*1024, cipher.KeyRefreshInterval*3)
 
 type StreamUnderlay struct {
@@ -186,6 +193,7 @@ func (t *StreamUnderlay) RunEventLoop(ctx context.Context) error {
 		return stderror.ErrNullPointer
 	}
 	defer t.conn.Close()
+	pacer, _ := t.conn.(payloadPacer)
 
 	for {
 		select {
@@ -222,6 +230,9 @@ func (t *StreamUnderlay) RunEventLoop(ctx context.Context) error {
 		} else if seg == nil {
 			// Timeout reading the segment, will try again later.
 			continue
+		}
+		if pacer != nil && !t.isClient && len(seg.payload) > 0 {
+			pacer.PacePayload(len(seg.payload))
 		}
 		if log.IsLevelEnabled(log.TraceLevel) {
 			log.Tracef("%v received %v", t, seg)
